@@ -1,11 +1,13 @@
 import json
 import os
+import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 from ytmusicapi import YTMusic
 
 _yt = None
+_ts_cache = {"value": None, "at": 0}
 
 def get_yt():
     """Cria/carrega uma única conexão com o YouTube Music."""
@@ -17,6 +19,17 @@ def get_yt():
         except Exception:
             _yt = YTMusic()
     return _yt
+
+def get_signature_timestamp(yt):
+    """Pega o 'carimbo de tempo' atual do YouTube (válido por ~30 min)."""
+    now = time.time()
+    if _ts_cache["value"] is None or now - _ts_cache["at"] > 1800:
+        try:
+            _ts_cache["value"] = yt.get_signatureTimestamp()
+        except Exception:
+            _ts_cache["value"] = None
+        _ts_cache["at"] = now
+    return _ts_cache["value"]
 
 def search_tracks(term, limit):
     yt = get_yt()
@@ -44,15 +57,28 @@ def search_tracks(term, limit):
 
 def stream_url(video_id):
     yt = get_yt()
-    song = yt.get_song(video_id)
+    ts = get_signature_timestamp(yt)
+    try:
+        song = yt.get_song(video_id, signatureTimestamp=ts)
+    except Exception:
+        song = yt.get_song(video_id)
+
     sd = song.get("streamingData") or {}
-    fmts = [f for f in (sd.get("adaptiveFormats") or []) if "audio" in (f.get("mimeType") or "")]
-    if not fmts:
-        fmts = sd.get("formats") or []
-    for f in fmts:
+    formats = sd.get("adaptiveFormats") or [] + (sd.get("formats") or [])
+
+    # 1) Prefere MP4/AAC (toca em qualquer aparelho, inclusive iPhone)
+    audio = [f for f in formats if "audio" in (f.get("mimeType") or "") and "mp4" in (f.get("mimeType") or "")]
+    # 2) Senão, qualquer formato de áudio
+    if not audio:
+        audio = [f for f in formats if "audio" in (f.get("mimeType") or "")]
+    # 3) Último recurso: qualquer formato
+    if not audio:
+        audio = formats
+
+    for f in audio:
         url = f.get("url")
         if url:
-            return url.replace("\\u0026", "&")
+            return url.replace("\\u0026", "&").replace("\\u003d", "=")
     return None
 
 class handler(BaseHTTPRequestHandler):
