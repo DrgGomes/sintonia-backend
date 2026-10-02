@@ -7,21 +7,28 @@ from urllib.parse import urlparse, parse_qs
 from ytmusicapi import YTMusic
 
 _yt = None
+_yt_auth = "missing"  # missing | ok | invalid
 _ts_cache = {"value": None, "at": 0}
 
+
 def get_yt():
-    """Cria/carrega uma única conexão com o YouTube Music."""
-    global _yt
+    global _yt, _yt_auth
     if _yt is None:
         raw = os.environ.get("YTM_HEADERS", "").strip()
-        try:
-            _yt = YTMusic(json.loads(raw)) if raw else YTMusic()
-        except Exception:
-            _yt = YTMusic()
+        if not raw:
+            _yt_auth = "missing"
+            _yt = YTMusic()  # anônimo
+        else:
+            try:
+                _yt = YTMusic(json.loads(raw))
+                _yt_auth = "ok"
+            except Exception:
+                _yt_auth = "invalid"
+                _yt = YTMusic()  # cai para anônimo mas marca inválido
     return _yt
 
+
 def get_signature_timestamp(yt):
-    """Pega o 'carimbo de tempo' atual do YouTube (válido por ~30 min)."""
     now = time.time()
     if _ts_cache["value"] is None or now - _ts_cache["at"] > 1800:
         try:
@@ -30,6 +37,7 @@ def get_signature_timestamp(yt):
             _ts_cache["value"] = None
         _ts_cache["at"] = now
     return _ts_cache["value"]
+
 
 def search_tracks(term, limit):
     yt = get_yt()
@@ -55,31 +63,42 @@ def search_tracks(term, limit):
         })
     return out
 
+
 def stream_url(video_id):
+    """Retorna (url, detalhe). Se url for None, detalhe explica o motivo."""
     yt = get_yt()
     ts = get_signature_timestamp(yt)
+    song = None
     try:
         song = yt.get_song(video_id, signatureTimestamp=ts)
-    except Exception:
-        song = yt.get_song(video_id)
+    except Exception as e1:
+        try:
+            song = yt.get_song(video_id)
+        except Exception as e2:
+            return None, f"get_song falhou: {e1} / {e2}"
 
     sd = song.get("streamingData") or {}
-    formats = sd.get("adaptiveFormats") or [] + (sd.get("formats") or [])
+    if not sd:
+        ps = song.get("playabilityStatus") or {}
+        return None, f"sem streamingData - playability: {ps.get('status')} / {ps.get('reason')}"
 
-    # 1) Prefere MP4/AAC (toca em qualquer aparelho, inclusive iPhone)
+    formats = list(sd.get("adaptiveFormats") or []) + list(sd.get("formats") or [])
+
+    # 1) áudio MP4/AAC (toca em qualquer aparelho, inclusive iPhone)
     audio = [f for f in formats if "audio" in (f.get("mimeType") or "") and "mp4" in (f.get("mimeType") or "")]
-    # 2) Senão, qualquer formato de áudio
+    # 2) qualquer formato de áudio
     if not audio:
         audio = [f for f in formats if "audio" in (f.get("mimeType") or "")]
-    # 3) Último recurso: qualquer formato
+    # 3) qualquer formato (último recurso)
     if not audio:
         audio = formats
 
     for f in audio:
         url = f.get("url")
         if url:
-            return url.replace("\\u0026", "&").replace("\\u003d", "=")
-    return None
+            return url.replace("\\u0026", "&").replace("\\u003d", "="), "ok"
+    return None, "formatos sem URL de áudio"
+
 
 class handler(BaseHTTPRequestHandler):
     def _headers(self):
@@ -106,6 +125,17 @@ class handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
             path = parsed.path.rstrip("/")
+
+            if path == "/api/status":
+                return self._json({
+                    "auth": _yt_auth,
+                    "mensagem": {
+                        "missing": "YTM_HEADERS ainda nao foi configurada no Vercel.",
+                        "invalid": "YTM_HEADERS foi configurada, mas o JSON e invalido (confira aspas/chaves/colchetes).",
+                        "ok": "YTM_HEADERS configurada corretamente.",
+                    }[_yt_auth],
+                })
+
             if path == "/api/search":
                 term = (params.get("q") or "").strip()
                 if not term:
@@ -115,15 +145,17 @@ class handler(BaseHTTPRequestHandler):
                 except ValueError:
                     limit = 20
                 return self._json({"tracks": search_tracks(term, limit)})
+
             if path == "/api/stream":
                 vid = (params.get("id") or "").strip()
                 if not vid:
                     return self._json({"error": "Falta o parâmetro 'id'."}, 400)
-                url = stream_url(vid)
+                url, detail = stream_url(vid)
                 if not url:
-                    return self._json({"error": "Não foi possível obter o áudio."}, 404)
-                return self._json({"url": url})
-            return self._json({"error": "Rota não encontrada."}, 404)
+                    return self._json({"error": "Não foi possível obter o áudio.", "detail": detail}, 404)
+                return self._json({"url": url, "auth": _yt_auth})
+
+            return self._json({"error": "Rota nao encontrada."}, 404)
         except Exception as exc:
             return self._json({"error": str(exc)}, 500)
 
