@@ -1,8 +1,8 @@
-# api/index.py — Seu servidor de música (catálogo mundial)
 import json
 import os
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
-from vercel import Request, Response
 from ytmusicapi import YTMusic
 
 _yt = None
@@ -18,18 +18,6 @@ def get_yt():
             _yt = YTMusic()
     return _yt
 
-def json_response(data, status=200):
-    return Response(
-        json.dumps(data, ensure_ascii=False),
-        status_code=status,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-        },
-    )
-
 def search_tracks(term, limit):
     yt = get_yt()
     results = yt.search(term, filter="songs", limit=limit)
@@ -42,7 +30,8 @@ def search_tracks(term, limit):
         cover = thumbs[-1].get("url", "") if thumbs else ""
         artists = r.get("artists") or []
         artist = artists[0].get("name", "") if artists else ""
-        album = (r.get("album") or {}).get("name", "") if r.get("album") else ""
+        album_obj = r.get("album") or {}
+        album = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
         out.append({
             "id": vid,
             "name": r.get("title", ""),
@@ -66,29 +55,51 @@ def stream_url(video_id):
             return url.replace("\\u0026", "&")
     return None
 
-def handler(request: Request):
-    if request.method == "OPTIONS":
-        return json_response({"ok": True})
-    path = (request.path or "").rstrip("/")
-    params = request.query_params or {}
-    try:
-        if path.endswith("/api/search"):
-            term = (params.get("q") or "").strip()
-            if not term:
-                return json_response({"error": "Falta o parâmetro 'q'."}, 400)
-            try:
-                limit = min(int(params.get("limit") or 20), 50)
-            except ValueError:
-                limit = 20
-            return json_response({"tracks": search_tracks(term, limit)})
-        if path.endswith("/api/stream"):
-            vid = (params.get("id") or "").strip()
-            if not vid:
-                return json_response({"error": "Falta o parâmetro 'id'."}, 400)
-            url = stream_url(vid)
-            if not url:
-                return json_response({"error": "Não foi possível obter o áudio."}, 404)
-            return json_response({"url": url})
-        return json_response({"error": "Rota não encontrada."}, 404)
-    except Exception as exc:
-        return json_response({"error": str(exc)}, 500)
+class handler(BaseHTTPRequestHandler):
+    def _headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+
+    def _json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self._headers()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._headers()
+        self.end_headers()
+
+    def do_GET(self):
+        try:
+            parsed = urlparse(self.path)
+            params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            path = parsed.path.rstrip("/")
+            if path == "/api/search":
+                term = (params.get("q") or "").strip()
+                if not term:
+                    return self._json({"error": "Falta o parâmetro 'q'."}, 400)
+                try:
+                    limit = min(int(params.get("limit") or 20), 50)
+                except ValueError:
+                    limit = 20
+                return self._json({"tracks": search_tracks(term, limit)})
+            if path == "/api/stream":
+                vid = (params.get("id") or "").strip()
+                if not vid:
+                    return self._json({"error": "Falta o parâmetro 'id'."}, 400)
+                url = stream_url(vid)
+                if not url:
+                    return self._json({"error": "Não foi possível obter o áudio."}, 404)
+                return self._json({"url": url})
+            return self._json({"error": "Rota não encontrada."}, 404)
+        except Exception as exc:
+            return self._json({"error": str(exc)}, 500)
+
+    def log_message(self, *args):
+        pass
